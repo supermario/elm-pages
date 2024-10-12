@@ -209,25 +209,39 @@ export function lookupOrPerform(
           },
         });
       } catch (error) {
-        if (error.code === "ECONNREFUSED") {
-          resolve({
-            kind: "response-json",
-            value: { "elm-pages-internal-error": "NetworkError" },
-          });
-        } else if (
-          error.code === "ETIMEDOUT" ||
-          error.code === "ERR_SOCKET_TIMEOUT"
-        ) {
-          resolve({
-            kind: "response-json",
-            value: { "elm-pages-internal-error": "Timeout" },
-          });
-        } else {
-          console.trace("elm-pages unhandled HTTP error", error);
-          resolve({
-            kind: "response-json",
-            value: { "elm-pages-internal-error": "NetworkError" },
-          });
+        switch (error.code) {
+          case "ECONNREFUSED": // Connection refused by the server
+          case "ENOTFOUND":    // Domain not found or invalid
+          case "EHOSTUNREACH": // Network unreachable
+          case "EAI_AGAIN":    // DNS lookup failed temporarily
+            resolve({
+              kind: "response-json",
+              value: { "elm-pages-internal-error": "NetworkError" },
+            });
+            break;
+
+          case "ETIMEDOUT":             // Request timed out
+          case "ERR_SOCKET_TIMEOUT":    // Socket timed out
+          case "EALREADY":              // Operation already in progress
+          case "ECONNRESET":            // Connection reset by peer
+          case "ERR_HTTP_HEADERS_SENT": // Headers already sent, error on response
+            resolve({
+              kind: "response-json",
+              value: { "elm-pages-internal-error": "Timeout" },
+            });
+            break;
+
+          default:
+            // There are many more to handle:
+            // https://nodejs.org/api/errors.html
+            // https://man7.org/linux/man-pages/man3/errno.3.html
+            // Don't expose them to end users for our purposes for now...
+            // console.trace("elm-pages unhandled HTTP error:", error);
+            resolve({
+              kind: "response-json",
+              value: { "elm-pages-internal-error": "UnknownError" },
+            });
+            break;
         }
       }
     }
