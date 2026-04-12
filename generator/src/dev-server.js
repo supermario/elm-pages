@@ -31,6 +31,8 @@ import { extractAndReplaceFrozenViews, replaceFrozenViewPlaceholders } from "./e
 import { toExactBuffer } from "./binary-helpers.js";
 import * as globby from "globby";
 import { fileURLToPath } from "url";
+import { randomUUID } from "node:crypto";
+import * as renderer from "./render.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -494,153 +496,252 @@ export async function start(options) {
     }
 
     const requestTime = new Date();
-    /** @type {string | null} */
-    let body = null;
+    const hasBody = ["POST", "PUT", "PATCH"].includes(req.method);
 
-    req.on("data", function (data) {
-      if (!body) {
-        body = "";
-      }
-      body += data;
-    });
+    if (hasBody) {
+      // For requests with a body, render on the main thread so that
+      // Stream.requestBody can access the request stream for
+      // serverRenderStreaming routes.
+      //
+      // The body is buffered so that Request.body (pure accessor) works
+      // for regular serverRender routes and route module form submissions.
+      // For serverRenderStreaming routes, Stream.requestBody falls back to
+      // Readable.from([bufferedBody]) in the dev server. True zero-copy
+      // streaming is available in the Node.js production adapter.
+      /** @type {string | null} */
+      let body = null;
 
-    req.on("end", async function () {
-      // TODO run render directly instead of in worker thread
-      await runRenderThread(
-        await reqToJson(req, body, requestTime),
-        pathname,
-        async function (renderResult) {
-          const is404 = renderResult.is404;
-          switch (renderResult.kind) {
-            case "bytes": {
-              // Create combined format for content.dat
-              // Format: [4 bytes: frozen views JSON length][N bytes: JSON][remaining: ResponseSketch]
-              // Extract frozen views from the HTML (needed for SPA navigation)
-              const { regions: frozenViews, html: updatedHtml } = extractAndReplaceFrozenViews(renderResult.html || "");
-              const frozenViewsJson = JSON.stringify(frozenViews);
-              const frozenViewsBuffer = Buffer.from(frozenViewsJson, 'utf8');
-              const lengthBuffer = Buffer.alloc(4);
-              lengthBuffer.writeUInt32BE(frozenViewsBuffer.length, 0);
-              const combinedBuffer = Buffer.concat([
-                lengthBuffer,
-                frozenViewsBuffer,
-                toExactBuffer(renderResult.contentDatPayload)
-              ]);
-              res.writeHead(is404 ? 404 : renderResult.statusCode, {
-                "Content-Type": "application/octet-stream",
-                ...renderResult.headers,
-              });
-              res.end(combinedBuffer);
-              break;
-            }
-            case "json": {
-              // TODO is this used anymore? I Think it's a dead code path and can be deleted
-              res.writeHead(is404 ? 404 : renderResult.statusCode, {
-                "Content-Type": "application/json",
-                ...renderResult.headers,
-              });
-              // is contentJson used any more? I think it can safely be deleted
-              res.end(renderResult.contentJson);
-              break;
-            }
-            case "html": {
-              try {
-                const template = templateHtml(true, config.headTagsTemplate);
-                const processedTemplate = await vite.transformIndexHtml(
-                  req.originalUrl,
-                  template
-                );
-                const info = renderResult.htmlString;
+      req.on("data", function (data) {
+        if (!body) body = "";
+        body += data;
+      });
 
-                // Replace __STATIC__ placeholders in HTML with indices
-                // (but don't include frozen views in bytesData - they're already in the rendered DOM)
-                const updatedHtml = replaceFrozenViewPlaceholders(info.html || "");
+      req.on("end", async function () {
+        // Don't register req in the stream registry — it's already consumed
+        // by the buffering above. The buffered body is available via
+        // currentBufferedBody (set in render.js from request.body) for both
+        // readBody BackendTask and Stream.requestBody fallback.
+        const serverRequest = await reqToJson(req, body, requestTime);
 
-                // Create combined format with empty frozen views for initial page load
-                // (frozen views are already in the DOM, so client adopts from there)
-                const emptyFrozenViews = {};
-                const frozenViewsJson = JSON.stringify(emptyFrozenViews);
-                const frozenViewsBuffer = Buffer.from(frozenViewsJson, 'utf8');
-                const lengthBuffer = Buffer.alloc(4);
-                lengthBuffer.writeUInt32BE(frozenViewsBuffer.length, 0);
-
-                // Decode original bytesData and prepend empty frozen views header
-                const originalBytes = Buffer.from(info.bytesData, 'base64');
-                const combinedBuffer = Buffer.concat([
-                  lengthBuffer,
-                  frozenViewsBuffer,
-                  originalBytes
-                ]);
-                const combinedBytesData = combinedBuffer.toString('base64');
-
-                const renderedHtml = processedTemplate
-                  .replace(
-                    /<!--\s*PLACEHOLDER_HEAD_AND_DATA\s*-->/,
-                    `${info.headTags}
-                  <script id="__ELM_PAGES_BYTES_DATA__" type="application/octet-stream">${combinedBytesData}</script>`
-                  )
-                  .replace(/<!--\s*PLACEHOLDER_TITLE\s*-->/, info.title)
-                  .replace(/<!--\s*PLACEHOLDER_HTML\s* -->/, updatedHtml)
-                  .replace(
-                    /<!-- ROOT -->\S*<html lang="en">/m,
-                    info.rootElement
-                  );
-                setHeaders(res, renderResult.headers);
-                res.writeHead(renderResult.statusCode, {
-                  "Content-Type": "text/html",
-                });
-                res.end(renderedHtml);
-              } catch (e) {
-                vite.ssrFixStacktrace(e);
-                next(e);
-              }
-              break;
-            }
-            case "api-response": {
-              if (renderResult.body.kind === "server-response") {
-                const serverResponse = renderResult.body;
-                setHeaders(res, serverResponse.headers);
-                res.writeHead(serverResponse.statusCode);
-                res.end(serverResponse.body);
-              } else if (renderResult.body.kind === "static-file") {
-                let mimeType = mimeTypes.lookup(pathname) || "text/html";
-                mimeType =
-                  mimeType === "application/octet-stream"
-                    ? "text/html"
-                    : mimeType;
-                res.writeHead(renderResult.statusCode, {
-                  "Content-Type": mimeType,
-                });
-                res.end(renderResult.body.body);
-                // TODO - if route is static, write file to api-route-cache/ directory
-                // TODO - get 404 or other status code from elm-pages renderer
-              } else {
-                throw (
-                  "Unexpected api-response renderResult: " +
-                  JSON.stringify(renderResult, null, 2)
-                );
-              }
-              break;
-            }
-            default: {
-              console.dir(renderResult);
-              throw "Unexpected renderResult kind: " + renderResult.kind;
-            }
-          }
-        },
-
-        function (error) {
-          console.log(restoreColorSafe(error));
-          if (req.url.includes("content.dat")) {
-            res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify(error));
-          } else {
-            res.writeHead(500, { "Content-Type": "text/html" });
-            res.end(errorHtml());
-          }
+        try {
+          await pendingCliCompile;
+          const portsFile = await loadPortsFile();
+          const elmModule = await requireElm();
+          const renderResult = await renderer.render(
+            portsFile,
+            options.base,
+            elmModule,
+            "dev-server",
+            pathname,
+            serverRequest,
+            function (patterns) {
+              patterns.forEach((p) => watcher.add(p));
+            },
+            true
+          );
+          await handleRenderResult(renderResult, req, res, pathname, next);
+        } catch (error) {
+          handleRenderError(error, req, res);
         }
-      );
-    });
+      });
+    } else {
+      // GET, HEAD, DELETE, OPTIONS — buffer any body (rare but valid),
+      // then dispatch to worker thread.
+      /** @type {string | null} */
+      let body = null;
+
+      req.on("data", function (data) {
+        if (!body) body = "";
+        body += data;
+      });
+
+      req.on("end", async function () {
+        await runRenderThread(
+          await reqToJson(req, body, requestTime),
+          pathname,
+          async function (renderResult) {
+            await handleRenderResult(renderResult, req, res, pathname, next);
+          },
+          function (error) {
+            handleRenderError(error, req, res);
+          }
+        );
+      });
+    }
+  }
+
+  /**
+   * Load the Elm module for main-thread rendering.
+   */
+  async function requireElm() {
+    const compiledElmPath = path.join(
+      process.cwd(),
+      "elm-stuff/elm-pages/elm.cjs"
+    );
+    const pathAsUrl = new URL(`file://${compiledElmPath}`);
+    const warnOriginal = console.warn;
+    console.warn = function () {};
+    const Elm = (await import(pathAsUrl.toString())).default;
+    console.warn = warnOriginal;
+    return Elm;
+  }
+
+  /**
+   * Load the custom-backend-task ports file for main-thread rendering.
+   */
+  async function loadPortsFile() {
+    const filePath = global.portsFilePath;
+    if (typeof filePath === "string") {
+      return await import(new URL(`file://${path.resolve(filePath)}`).href);
+    }
+    return filePath;
+  }
+
+  /**
+   * Handle the render result from either the worker thread or main-thread render.
+   * @param {Object} renderResult
+   * @param {http.IncomingMessage} req
+   * @param {http.ServerResponse} res
+   * @param {string} pathname
+   * @param {connect.NextHandleFunction} next
+   */
+  async function handleRenderResult(renderResult, req, res, pathname, next) {
+    const is404 = renderResult.is404;
+    switch (renderResult.kind) {
+      case "bytes": {
+        const { regions: frozenViews, html: updatedHtml } = extractAndReplaceFrozenViews(renderResult.html || "");
+        const frozenViewsJson = JSON.stringify(frozenViews);
+        const frozenViewsBuffer = Buffer.from(frozenViewsJson, 'utf8');
+        const lengthBuffer = Buffer.alloc(4);
+        lengthBuffer.writeUInt32BE(frozenViewsBuffer.length, 0);
+        const combinedBuffer = Buffer.concat([
+          lengthBuffer,
+          frozenViewsBuffer,
+          toExactBuffer(renderResult.contentDatPayload)
+        ]);
+        res.writeHead(is404 ? 404 : renderResult.statusCode, {
+          "Content-Type": "application/octet-stream",
+          ...renderResult.headers,
+        });
+        res.end(combinedBuffer);
+        break;
+      }
+      case "json": {
+        res.writeHead(is404 ? 404 : renderResult.statusCode, {
+          "Content-Type": "application/json",
+          ...renderResult.headers,
+        });
+        res.end(renderResult.contentJson);
+        break;
+      }
+      case "html": {
+        try {
+          const template = templateHtml(true, config.headTagsTemplate);
+          const processedTemplate = await vite.transformIndexHtml(
+            req.originalUrl,
+            template
+          );
+          const info = renderResult.htmlString;
+          const updatedHtml = replaceFrozenViewPlaceholders(info.html || "");
+          const emptyFrozenViews = {};
+          const frozenViewsJson = JSON.stringify(emptyFrozenViews);
+          const frozenViewsBuffer = Buffer.from(frozenViewsJson, 'utf8');
+          const lengthBuffer = Buffer.alloc(4);
+          lengthBuffer.writeUInt32BE(frozenViewsBuffer.length, 0);
+          const originalBytes = Buffer.from(info.bytesData, 'base64');
+          const combinedBuffer = Buffer.concat([
+            lengthBuffer,
+            frozenViewsBuffer,
+            originalBytes
+          ]);
+          const combinedBytesData = combinedBuffer.toString('base64');
+          const renderedHtml = processedTemplate
+            .replace(
+              /<!--\s*PLACEHOLDER_HEAD_AND_DATA\s*-->/,
+              `${info.headTags}
+                  <script id="__ELM_PAGES_BYTES_DATA__" type="application/octet-stream">${combinedBytesData}</script>`
+            )
+            .replace(/<!--\s*PLACEHOLDER_TITLE\s*-->/, info.title)
+            .replace(/<!--\s*PLACEHOLDER_HTML\s* -->/, updatedHtml)
+            .replace(
+              /<!-- ROOT -->\S*<html lang="en">/m,
+              info.rootElement
+            );
+          setHeaders(res, renderResult.headers);
+          res.writeHead(renderResult.statusCode, {
+            "Content-Type": "text/html",
+          });
+          res.end(renderedHtml);
+        } catch (e) {
+          vite.ssrFixStacktrace(e);
+          next(e);
+        }
+        break;
+      }
+      case "api-response": {
+        if (renderResult.body.kind === "server-response") {
+          const serverResponse = renderResult.body;
+          setHeaders(res, serverResponse.headers);
+          res.writeHead(serverResponse.statusCode);
+          res.end(serverResponse.body);
+        } else if (renderResult.body.kind === "streaming-server-response") {
+          const streamingResponse = renderResult.body;
+          // Headers are delayed until first data chunk — if the stream
+          // errors before producing data (file not found, etc.), we can
+          // still send a proper error response.
+          const result = await renderer.executeStreamToResponse(
+            streamingResponse.streamPipeline,
+            res,
+            await loadPortsFile(),
+            {
+              statusCode: streamingResponse.statusCode,
+              headers: streamingResponse.headers,
+            }
+          );
+          if (!result.ok) {
+            res.writeHead(500, { "Content-Type": "text/plain" });
+            res.end("Streaming response error: " + result.error);
+          }
+        } else if (renderResult.body.kind === "static-file") {
+          let mimeType = mimeTypes.lookup(pathname) || "text/html";
+          mimeType =
+            mimeType === "application/octet-stream"
+              ? "text/html"
+              : mimeType;
+          res.writeHead(renderResult.statusCode, {
+            "Content-Type": mimeType,
+          });
+          res.end(renderResult.body.body);
+        } else {
+          throw (
+            "Unexpected api-response renderResult: " +
+            JSON.stringify(renderResult, null, 2)
+          );
+        }
+        break;
+      }
+      default: {
+        console.dir(renderResult);
+        throw "Unexpected renderResult kind: " + renderResult.kind;
+      }
+    }
+  }
+
+  /**
+   * Handle errors from the render process.
+   * @param {*} error
+   * @param {http.IncomingMessage} req
+   * @param {http.ServerResponse} res
+   */
+  function handleRenderError(error, req, res) {
+    console.log(restoreColorSafe(error));
+    if (req.url.includes("content.dat")) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(error));
+    } else {
+      res.writeHead(500, { "Content-Type": "text/html" });
+      res.end(errorHtml());
+    }
   }
 
   /**

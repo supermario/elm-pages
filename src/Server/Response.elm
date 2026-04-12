@@ -4,7 +4,7 @@ module Server.Response exposing
     , map
     , errorPage, mapError
     , temporaryRedirect, permanentRedirect
-    , json, plainText, emptyBody, body, bytesBody, base64Body
+    , json, plainText, emptyBody, body, bytesBody, base64Body, streaming
     , withHeader, withHeaders, withStatusCode, withSetCookieHeader
     , toJson
     )
@@ -81,7 +81,7 @@ You can use `withHeader` and `withStatusCode` to customize either type of Respon
 
 ## Response Body
 
-@docs json, plainText, emptyBody, body, bytesBody, base64Body
+@docs json, plainText, emptyBody, body, bytesBody, base64Body, streaming
 
 
 ## Amending Responses
@@ -95,6 +95,7 @@ You can use `withHeader` and `withStatusCode` to customize either type of Respon
 
 -}
 
+import BackendTask.Stream
 import Bytes exposing (Bytes)
 import Json.Encode
 import PageServerResponse exposing (PageServerResponse(..))
@@ -117,6 +118,9 @@ map mapFn pageServerResponse =
         ServerResponse serverResponse ->
             ServerResponse serverResponse
 
+        StreamingServerResponse streamingResponse ->
+            StreamingServerResponse streamingResponse
+
         ErrorPage error response ->
             ErrorPage error response
 
@@ -131,6 +135,9 @@ mapError mapFn pageServerResponse =
 
         ServerResponse serverResponse ->
             ServerResponse serverResponse
+
+        StreamingServerResponse streamingResponse ->
+            StreamingServerResponse streamingResponse
 
         ErrorPage error response ->
             ErrorPage (mapFn error) response
@@ -236,6 +243,50 @@ bytesBody bytes =
         |> ServerResponse
 
 
+{-| Build a streaming `Response` whose body is produced by a [`BackendTask.Stream`](BackendTask-Stream) pipeline. The stream
+is piped directly to the HTTP response, so data flows to the client with constant memory — ideal for serving large files.
+
+    import BackendTask.Stream as Stream
+    import Server.Response as Response
+
+    -- Serve a large file as a streaming download
+    Stream.fileRead (Path.fromString "backups/data.tar.gz")
+        |> Response.streaming
+            { statusCode = 200
+            , headers =
+                [ ( "Content-Type", "application/gzip" )
+                , ( "Content-Disposition", "attachment; filename=\"data.tar.gz\"" )
+                ]
+            }
+
+You can compose any stream pipeline before streaming it as a response:
+
+    Stream.fileRead (Path.fromString "data.json")
+        |> Stream.pipe Stream.gzip
+        |> Response.streaming
+            { statusCode = 200
+            , headers = [ ( "Content-Encoding", "gzip" ), ( "Content-Type", "application/json" ) ]
+            }
+
+**Note:** True streaming is available with the Node.js server adapter or the dev server. Serverless adapters
+(like Netlify) will buffer the full response before sending. Use this in routes defined with
+[`ApiRoute.serverRenderStreaming`](ApiRoute#serverRenderStreaming).
+
+-}
+streaming :
+    { statusCode : Int
+    , headers : List ( String, String )
+    }
+    -> BackendTask.Stream.Stream streamError metadata { read : (), write : fromWriteable }
+    -> Response data error
+streaming { statusCode, headers } stream =
+    StreamingServerResponse
+        { statusCode = statusCode
+        , headers = headers
+        , streamPipeline = BackendTask.Stream.encodePipeline stream
+        }
+
+
 {-| Build a JSON body from a `Json.Encode.Value`.
 
     Json.Encode.object
@@ -315,6 +366,9 @@ withStatusCode statusCode serverResponse =
         ServerResponse response ->
             ServerResponse { response | statusCode = statusCode }
 
+        StreamingServerResponse streamingResponse ->
+            StreamingServerResponse { streamingResponse | statusCode = statusCode }
+
         ErrorPage error _ ->
             never error
 
@@ -335,6 +389,9 @@ withHeader name value serverResponse =
 
         ServerResponse response ->
             ServerResponse { response | headers = ( name, value ) :: response.headers }
+
+        StreamingServerResponse streamingResponse ->
+            StreamingServerResponse { streamingResponse | headers = ( name, value ) :: streamingResponse.headers }
 
         ErrorPage error response ->
             ErrorPage error { response | headers = ( name, value ) :: response.headers }
@@ -358,6 +415,9 @@ withHeaders headers serverResponse =
 
         ServerResponse response ->
             ServerResponse { response | headers = headers ++ response.headers }
+
+        StreamingServerResponse streamingResponse ->
+            StreamingServerResponse { streamingResponse | headers = headers ++ streamingResponse.headers }
 
         ErrorPage error response ->
             ErrorPage error { response | headers = headers ++ response.headers }
@@ -388,6 +448,9 @@ toJson response =
 
         ServerResponse serverResponse ->
             PageServerResponse.toJson serverResponse
+
+        StreamingServerResponse streamingResponse ->
+            PageServerResponse.streamingResponseToJson streamingResponse
 
         ErrorPage error _ ->
             never error

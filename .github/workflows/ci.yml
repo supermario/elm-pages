@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - http-streaming
   pull_request:
     branches:
       - master

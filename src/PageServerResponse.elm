@@ -1,4 +1,4 @@
-module PageServerResponse exposing (PageServerResponse(..), Response, toJson, toRedirect)
+module PageServerResponse exposing (PageServerResponse(..), Response, StreamingResponseData, toJson, toRedirect, streamingResponseToJson)
 
 import Bytes exposing (Bytes)
 import Dict
@@ -13,7 +13,34 @@ type PageServerResponse data error
         }
         data
     | ServerResponse Response
+    | StreamingServerResponse StreamingResponseData
     | ErrorPage error { headers : List ( String, String ) }
+
+
+{-| Data for a streaming response. The `streamPipeline` is a JSON-encoded stream
+pipeline definition (same format as BackendTask.Stream internals) that will be
+executed on the JS side and piped to the HTTP response.
+-}
+type alias StreamingResponseData =
+    { statusCode : Int
+    , headers : List ( String, String )
+    , streamPipeline : Json.Encode.Value
+    }
+
+
+streamingResponseToJson : StreamingResponseData -> Json.Encode.Value
+streamingResponseToJson streamingResponse =
+    Json.Encode.object
+        [ ( "statusCode", Json.Encode.int streamingResponse.statusCode )
+        , ( "headers"
+          , streamingResponse.headers
+                |> collectMultiValueHeaders
+                |> List.map (Tuple.mapSecond (Json.Encode.list Json.Encode.string))
+                |> Json.Encode.object
+          )
+        , ( "kind", Json.Encode.string "streaming-server-response" )
+        , ( "streamPipeline", streamingResponse.streamPipeline )
+        ]
 
 
 toRedirect :

@@ -3,7 +3,7 @@ module Server.Request exposing
     , requestTime
     , header, headers
     , method, Method(..), methodToString
-    , body, jsonBody
+    , body, readBody, jsonBody
     , formData, formDataWithServerValidation
     , rawFormData
     , rawUrl
@@ -81,7 +81,7 @@ cookie and render a light- or dark-themed page and render a different page.
 
 ## Request Body
 
-@docs body, jsonBody
+@docs body, readBody, jsonBody
 
 
 ## Forms
@@ -110,6 +110,8 @@ cookie and render a light- or dark-themed page and render a different page.
 -}
 
 import BackendTask exposing (BackendTask)
+import BackendTask.Http
+import BackendTask.Internal.Request
 import Dict exposing (Dict)
 import FatalError exposing (FatalError)
 import Form
@@ -722,7 +724,52 @@ type alias Request =
 
 
 {-| The Request body, if present (or `Nothing` if there is no request body).
+
+In a [`serverRender`](ApiRoute#serverRender) route, the body is automatically buffered and available here.
+In a [`serverRenderStreaming`](ApiRoute#serverRenderStreaming) route, this returns `Nothing` — use
+[`BackendTask.Stream.requestBody`](BackendTask-Stream#requestBody) to access the body as a stream, or
+[`readBody`](#readBody) to read it into a `String`.
+
 -}
 body : Request -> Maybe String
 body (Internal.Request.Request req) =
     req.body
+
+
+{-| Read the full request body as a `String`. Unlike [`body`](#body), this works in all contexts — including
+[`ApiRoute.serverRenderStreaming`](ApiRoute#serverRenderStreaming) routes where the body is not pre-buffered.
+
+  - In a [`serverRender`](ApiRoute#serverRender) route: returns the same value as [`body`](#body), since the body is
+    auto-buffered. You typically don't need `readBody` here — just use `body`.
+  - In a [`serverRenderStreaming`](ApiRoute#serverRenderStreaming) route: reads the request body stream into a string.
+    This consumes the stream, so you cannot use [`BackendTask.Stream.requestBody`](BackendTask-Stream#requestBody)
+    after calling `readBody`.
+
+Returns `Nothing` if there is no request body (e.g., `GET` requests).
+
+    import BackendTask exposing (BackendTask)
+    import FatalError exposing (FatalError)
+    import Server.Request as Request
+    import Server.Response as Response
+
+    handlePost request =
+        Request.readBody
+            |> BackendTask.map
+                (\maybeBody ->
+                    case maybeBody of
+                        Just bodyStr ->
+                            Response.plainText ("Received: " ++ bodyStr)
+
+                        Nothing ->
+                            Response.plainText "No body"
+                                |> Response.withStatusCode 400
+                )
+
+-}
+readBody : BackendTask FatalError (Maybe String)
+readBody =
+    BackendTask.Internal.Request.request
+        { name = "read-request-body"
+        , body = BackendTask.Http.emptyBody
+        , expect = Json.Decode.maybe (Json.Decode.field "body" Json.Decode.string)
+        }

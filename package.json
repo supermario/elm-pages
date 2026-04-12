@@ -11,7 +11,8 @@
     "test": "./test.sh",
     "test:snapshot": "(cd examples/escaping && npm ci && npm test) && (cd examples/base-path && npm ci && npm test)",
     "cypress": "npm start & cypress run",
-    "build:generator": "elm-codegen install && (cd codegen && lamdera make Generate.elm --output elm-pages-codegen.js && mv elm-pages-codegen.js elm-pages-codegen.cjs)",
+    "prepare": "npm run build:generator",
+    "build:generator": "elm-codegen install --cwd codegen && cd codegen && lamdera make Generate.elm --output elm-pages-codegen.js && mv elm-pages-codegen.js elm-pages-codegen.cjs",
     "review": "elm-review",
     "format": "prettier . --write --cache --cache-location='node_modules/.cache/.prettiercache' --log-level=warn"
   },
@@ -85,7 +86,7 @@
     "generator/server-review/",
     "generator/shared/",
     "src/",
-    "codegen/elm-pages-codegen.cjs",
+    "codegen/",
     "generator/template/",
     "generator/static-code/"
   ],

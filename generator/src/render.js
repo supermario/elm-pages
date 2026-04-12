@@ -43,6 +43,46 @@ let verbosity = 2;
 const spinnies = new Spinnies();
 let configuredDbPath = "db.bin";
 
+/** @type {Map<string, import('node:stream').Readable>} */
+const requestBodyStreams = new Map();
+/** @type {string | null} */
+let currentRequestId = null;
+/** @type {string | null} */
+let currentBufferedBody = null;
+
+/**
+ * Register an HTTP request body stream for use by Stream.requestBody.
+ * @param {string} id - Unique request identifier
+ * @param {import('node:stream').Readable} stream - The request body stream
+ */
+export function registerRequestBodyStream(id, stream) {
+  requestBodyStreams.set(id, stream);
+}
+
+/**
+ * Unregister a previously registered request body stream.
+ * @param {string} id - Unique request identifier
+ */
+export function unregisterRequestBodyStream(id) {
+  requestBodyStreams.delete(id);
+}
+
+/**
+ * Set the current request ID for stream lookup during render.
+ * @param {string | null} id
+ */
+export function setCurrentRequestId(id) {
+  currentRequestId = id;
+}
+
+/**
+ * Set the current buffered body for serverless fallback.
+ * @param {string | null} body
+ */
+export function setCurrentBufferedBody(body) {
+  currentBufferedBody = body;
+}
+
 process.on("unhandledRejection", (error) => {
   console.error(error);
 });
@@ -51,6 +91,121 @@ let foundErrors;
 /**
  * @typedef {{ [x: string]: (arg0: unknown, arg1: { cwd: string; quiet: boolean; env: NodeJS.ProcessEnv; }) => unknown; }} PortsFile
  */
+
+/**
+ * Execute a stream pipeline and pipe its output to a writable destination (e.g., an HTTP response).
+ * Used for streaming responses where data flows directly to the client.
+ *
+ * @param {{ kind: string; parts: StreamPart[] }} pipeline - The serialized stream pipeline from Elm
+ * @param {import('node:stream').Writable} destination - The writable destination (e.g., http.ServerResponse)
+ * @param {PortsFile} portsFile - The custom backend task ports file
+ * @returns {Promise<void>}
+ */
+/**
+ * Execute a stream pipeline and pipe its output to an HTTP response.
+ *
+ * Headers are NOT written until the first data chunk arrives. This means
+ * that if the stream errors before producing any data (file not found,
+ * permission denied, command not found, connection refused, etc.), the
+ * caller can still send a proper error response with the right status code.
+ *
+ * @param {{ kind: string; parts: StreamPart[] }} pipeline
+ * @param {import('node:http').ServerResponse} res
+ * @param {PortsFile} portsFile
+ * @param {{ statusCode: number; headers: Object }} responseInfo - headers/status to write on first chunk
+ * @returns {Promise<{ ok: true } | { ok: false, error: string }>}
+ */
+export async function executeStreamToResponse(
+  pipeline,
+  res,
+  portsFile,
+  responseInfo
+) {
+  const context = { cwd: process.cwd(), quiet: false, env: process.env };
+  let lastStream = null;
+
+  // Build the pipeline. If any part fails to set up (e.g., file not found),
+  // pipePartToStream throws before we've written any headers.
+  try {
+    for (const part of pipeline.parts) {
+      const dummyResolve = (value) => {
+        if (value && value.error) {
+          throw value.error;
+        }
+      };
+      const { stream } = await pipePartToStream(
+        lastStream,
+        part,
+        context,
+        portsFile,
+        dummyResolve,
+        false,
+        pipeline.kind
+      );
+      lastStream = stream;
+    }
+  } catch (setupError) {
+    // Pipeline setup failed before any data — caller can still send error response
+    return { ok: false, error: setupError.toString() };
+  }
+
+  if (!lastStream) {
+    // Empty pipeline — send headers and end
+    setStreamHeaders(res, responseInfo);
+    res.end();
+    return { ok: true };
+  }
+
+  // Delay writing headers until first data chunk. If the stream errors
+  // before producing any data, we can still return an error response.
+  return new Promise((resolve) => {
+    let headersSent = false;
+
+    lastStream.on("data", (chunk) => {
+      if (!headersSent) {
+        setStreamHeaders(res, responseInfo);
+        headersSent = true;
+      }
+      res.write(chunk);
+    });
+
+    lastStream.on("end", () => {
+      if (!headersSent) {
+        // Stream ended without producing data — still send headers
+        setStreamHeaders(res, responseInfo);
+      }
+      res.end();
+      resolve({ ok: true });
+    });
+
+    lastStream.on("error", (error) => {
+      if (!headersSent) {
+        // Error before any data sent — caller can still handle this
+        resolve({ ok: false, error: error.message });
+      } else {
+        // Error after data started flowing — response is truncated.
+        // This is the same behavior as every HTTP framework (Rails,
+        // Express, Go, Phoenix) — the client sees a connection reset
+        // or truncated chunked response.
+        res.end();
+        resolve({ ok: true });
+      }
+    });
+  });
+}
+
+function setStreamHeaders(res, responseInfo) {
+  if (responseInfo && responseInfo.headers) {
+    for (const [key, values] of Object.entries(responseInfo.headers)) {
+      if (Array.isArray(values)) {
+        values.forEach((v) => res.setHeader(key, v));
+      } else {
+        res.setHeader(key, values);
+      }
+    }
+  }
+  res.writeHead(responseInfo ? responseInfo.statusCode : 200);
+}
 
 /**
  * @param {string} basePath
@@ -80,6 +235,10 @@ export async function render(
   // we can provide a fake HTTP instead of xhr2 (which is otherwise needed for Elm HTTP requests from Node)
   global.XMLHttpRequest = {};
   configuredDbPath = "db.bin";
+
+  // Store the buffered body for serverless fallback (Stream.requestBody)
+  currentBufferedBody =
+    request && typeof request.body === "string" ? request.body : null;
   const result = await runElmApp(
     portsFile,
     basePath,
@@ -747,6 +906,8 @@ async function runInternalJob(
         return [requestHash, await runReadKey(requestToPerform)];
       case "elm-pages-internal://stream":
         return [requestHash, await runStream(requestToPerform, portsFile)];
+      case "elm-pages-internal://read-request-body":
+        return [requestHash, await runReadRequestBody(requestToPerform)];
       case "elm-pages-internal://start-spinner":
         return [requestHash, runStartSpinner(requestToPerform)];
       case "elm-pages-internal://stop-spinner":
@@ -1400,6 +1561,27 @@ async function runReadKey(req) {
 }
 
 /**
+ * Read the current request body, either from the registered stream or from
+ * the buffered body string. Returns the body as a string, or null if no body
+ * is available.
+ */
+async function runReadRequestBody(req) {
+  const stream = currentRequestId
+    ? requestBodyStreams.get(currentRequestId)
+    : null;
+  if (stream) {
+    try {
+      const body = await consumers.text(stream);
+      return jsonResponse(req, { body });
+    } catch (error) {
+      return jsonResponse(req, { error: error.toString() });
+    }
+  }
+  // Fall back to the buffered body (set by serverless adapters or non-streaming path)
+  return jsonResponse(req, { body: currentBufferedBody });
+}
+
+/**
  * @param {InternalStreamJob} req
  * @param {PortsFile} portsFile
  */
@@ -1484,7 +1666,7 @@ function runStream(req, portsFile) {
 }
 
 /**
- * @typedef {StreamPartWith<"unzip", {}> | StreamPartWith<"gzip", {}> | StreamPartWith<"stdin", {}> | StreamPartWith<"stdout", {}> | StreamPartWith<"stderr", {}> | FromStringPart | CommandPart | HttpWritePart | FileReadPart | FileWritePart | CustomReadPart | CustomWritePart | CustomDuplexPart} StreamPart
+ * @typedef {StreamPartWith<"unzip", {}> | StreamPartWith<"gzip", {}> | StreamPartWith<"stdin", {}> | StreamPartWith<"stdout", {}> | StreamPartWith<"stderr", {}> | StreamPartWith<"requestBody", {}> | FromStringPart | CommandPart | HttpWritePart | FileReadPart | FileWritePart | CustomReadPart | CustomWritePart | CustomDuplexPart} StreamPart
  *
  * @typedef {StreamPartWith<"fromString", { string: string; }>} FromStringPart
  * @typedef {StreamPartWith<"command", { command: string; args: string[]; allowNon0Status: boolean; output: "Ignore" | "Print" | "MergeWithStdout" | "InsteadOfStdout"; timeoutInMs: number?; }>} CommandPart
@@ -1768,9 +1950,26 @@ async function pipePartToStream(
     }
   } else if (part.name === "fromString") {
     return { stream: Readable.from([part.string]) };
+  } else if (part.name === "requestBody") {
+    const stream = requestBodyStreams.get(currentRequestId);
+    if (stream) {
+      stream.once("error", (error) => {
+        stream.destroy();
+        resolve({
+          error: `Request body stream error: ${error.message}`,
+        });
+      });
+      return { stream };
+    }
+    // Fallback for serverless environments where the body is pre-buffered
+    if (currentBufferedBody !== null) {
+      return { stream: Readable.from([currentBufferedBody]) };
+    }
+    throw (
+      "Stream.requestBody: no request body stream available. " +
+      "This stream source is only available in routes defined with ApiRoute.serverRenderStreaming."
+    );
   } else {
-    // console.error(`Unknown stream part: ${part.name}!`);
-    // process.exit(1);
     throw `Unknown stream part: ${part.name}!`;
   }
 }

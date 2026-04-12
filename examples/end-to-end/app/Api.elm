@@ -3,6 +3,7 @@ module Api exposing (routes)
 import ApiRoute exposing (ApiRoute)
 import BackendTask exposing (BackendTask)
 import BackendTask.Http
+import BackendTask.Stream as Stream
 import FatalError exposing (FatalError)
 import Form
 import Form.Field as Field
@@ -58,6 +59,8 @@ routes getStaticRoutes htmlToString =
     , multipleContentTypes
     , errorRoute
     , proxy
+    , streamingUpload
+    , streamingDownload
     ]
 
 
@@ -279,3 +282,57 @@ proxy =
         |> ApiRoute.slash
         |> ApiRoute.literal "proxy"
         |> ApiRoute.serverRender
+
+
+{-| Streaming upload: accepts a POST body via `Stream.requestBody` and writes
+it directly to disk at `uploads/streamed-file.bin`. The body is never buffered
+into memory, so this works for arbitrarily large files.
+
+    curl -X POST --data-binary @myfile.bin \
+         http://localhost:1234/api/stream-upload
+
+-}
+streamingUpload : ApiRoute ApiRoute.Response
+streamingUpload =
+    ApiRoute.succeed
+        (\request ->
+            request
+                |> Stream.requestBody
+                |> Stream.pipe (Stream.fileWrite "uploads/streamed-file.bin")
+                |> Stream.run
+                |> BackendTask.map
+                    (\_ ->
+                        Encode.object [ ( "ok", Encode.bool True ) ]
+                            |> Response.json
+                    )
+        )
+        |> ApiRoute.literal "api"
+        |> ApiRoute.slash
+        |> ApiRoute.literal "stream-upload"
+        |> ApiRoute.serverRenderStreaming
+
+
+{-| Streaming download: serves a file from disk as a streaming HTTP response.
+The file is piped directly to the client with constant memory.
+
+    curl http://localhost:1234/api/stream-download -o downloaded-file.bin
+
+-}
+streamingDownload : ApiRoute ApiRoute.Response
+streamingDownload =
+    ApiRoute.succeed
+        (\request ->
+            Stream.fileRead "uploads/streamed-file.bin"
+                |> Response.streaming
+                    { statusCode = 200
+                    , headers =
+                        [ ( "Content-Type", "application/octet-stream" )
+                        , ( "Content-Disposition", "attachment; filename=\"streamed-file.bin\"" )
+                        ]
+                    }
+                |> BackendTask.succeed
+        )
+        |> ApiRoute.literal "api"
+        |> ApiRoute.slash
+        |> ApiRoute.literal "stream-download"
+        |> ApiRoute.serverRenderStreaming

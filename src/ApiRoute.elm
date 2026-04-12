@@ -1,6 +1,7 @@
 module ApiRoute exposing
     ( single, preRender
     , serverRender
+    , serverRenderStreaming
     , preRenderWithFallback
     , ApiRoute, ApiRouteBuilder, Response
     , capture, literal, slash, succeed
@@ -47,6 +48,8 @@ a server-rendered ApiRoute accesses the incoming HTTP request through a [Server.
   - Look at the [accepted language in the request headers](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Accept-Language) and use that to choose a language for the response data.
 
 @docs serverRender
+
+@docs serverRenderStreaming
 
 You can also do a hybrid approach using `preRenderWithFallback`. This allows you to pre-render a set of routes at build-time, but build additional routes that weren't rendered at build-time on the fly on the server.
 Conceptually, this is just a delayed version of a pre-rendered route. Because of that, you _do not_ have access to the incoming HTTP request (no `Server.Request.Parser` like in server-rendered ApiRoute's).
@@ -222,7 +225,17 @@ serverRender ((Internal.ApiRoute.ApiRouteBuilder patterns pattern _ _ _) as full
                 Internal.ApiRoute.tryMatch path fullHandler
                     |> Maybe.map
                         (\toBackendTask ->
-                            toBackendTask (Internal.Request.toRequest serverRequest)
+                            -- Auto-read the request body so that Request.body works.
+                            -- The body may not be pre-buffered (e.g., in the dev server),
+                            -- so we read it via BackendTask and inject it into the request.
+                            Server.Request.readBody
+                                |> BackendTask.andThen
+                                    (\maybeBody ->
+                                        toBackendTask
+                                            (Internal.Request.toRequest serverRequest
+                                                |> Internal.Request.withBody maybeBody
+                                            )
+                                    )
                         )
                     |> Maybe.map (BackendTask.map (Server.Response.toJson >> Just))
                     |> Maybe.withDefault
@@ -240,6 +253,95 @@ serverRender ((Internal.ApiRoute.ApiRouteBuilder patterns pattern _ _ _) as full
                     )
         , pattern = patterns
         , kind = "serverless"
+        , globalHeadTags = Nothing
+        }
+
+
+{-| Like [`serverRender`](#serverRender), but for routes that handle large request bodies (100 MB – 10 GB) with constant
+memory. The incoming HTTP request body is **not** buffered — instead, it is available as a stream via
+[`BackendTask.Stream.requestBody`](BackendTask-Stream#requestBody).
+
+Use `serverRenderStreaming` when you need to:
+
+  - Accept large file uploads and write them directly to disk
+  - Pipe an incoming request body through transformations (decompress, encrypt, etc.) without holding it all in memory
+  - Forward an incoming body to another service as a stream
+
+Because the body is not buffered, [`Server.Request.body`](Server-Request#body) will return `Nothing`. If you need the
+body as a `String`, use [`Server.Request.readBody`](Server-Request#readBody) instead — but keep in mind that reading the
+full body into a `String` defeats the purpose of streaming for large payloads.
+
+    import ApiRoute
+    import BackendTask
+    import BackendTask.Stream as Stream
+    import Json.Encode as Encode
+    import Server.Response as Response
+
+    uploadRoute : ApiRoute.ApiRoute ApiRoute.Response
+    uploadRoute =
+        ApiRoute.succeed
+            (\request ->
+                request
+                    |> Stream.requestBody
+                    |> Stream.pipe (Stream.fileWrite "uploads/data.bin")
+                    |> Stream.run
+                    |> BackendTask.map
+                        (\_ ->
+                            Encode.object [ ( "ok", Encode.bool True ) ]
+                                |> Response.json
+                        )
+            )
+            |> ApiRoute.literal "api"
+            |> ApiRoute.slash
+            |> ApiRoute.literal "upload"
+            |> ApiRoute.serverRenderStreaming
+
+You can also serve large files as streaming responses using [`Server.Response.streaming`](Server-Response#streaming):
+
+    downloadRoute : ApiRoute.ApiRoute ApiRoute.Response
+    downloadRoute =
+        ApiRoute.succeed
+            (\request ->
+                Stream.fileRead "backups/archive.tar.gz"
+                    |> Response.streaming
+                        { statusCode = 200
+                        , headers = [ ( "Content-Type", "application/gzip" ) ]
+                        }
+                    |> BackendTask.succeed
+            )
+            |> ApiRoute.literal "api"
+            |> ApiRoute.slash
+            |> ApiRoute.literal "download"
+            |> ApiRoute.serverRenderStreaming
+
+-}
+serverRenderStreaming : ApiRouteBuilder (Server.Request.Request -> BackendTask FatalError (Server.Response.Response Never Never)) constructor -> ApiRoute Response
+serverRenderStreaming ((Internal.ApiRoute.ApiRouteBuilder patterns pattern _ _ _) as fullHandler) =
+    Internal.ApiRoute.ApiRoute
+        { regex = Regex.fromString ("^" ++ pattern ++ "$") |> Maybe.withDefault Regex.never
+        , matchesToResponse =
+            \serverRequest path ->
+                Internal.ApiRoute.tryMatch path fullHandler
+                    |> Maybe.map
+                        (\toBackendTask ->
+                            toBackendTask (Internal.Request.toRequest serverRequest)
+                        )
+                    |> Maybe.map (BackendTask.map (Server.Response.toJson >> Just))
+                    |> Maybe.withDefault
+                        (BackendTask.succeed Nothing)
+        , buildTimeRoutes = BackendTask.succeed []
+        , handleRoute =
+            \path ->
+                BackendTask.succeed
+                    (case Internal.ApiRoute.tryMatch path fullHandler of
+                        Just _ ->
+                            True
+
+                        Nothing ->
+                            False
+                    )
+        , pattern = patterns
+        , kind = "serverless-streaming"
         , globalHeadTags = Nothing
         }
 

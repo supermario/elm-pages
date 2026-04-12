@@ -652,6 +652,18 @@ initLegacy site ((RenderRequest.SinglePage includeHtml singleRequest _) as rende
                                                                                                     Effect.SendSinglePage apiResponse
                                                                                             )
 
+                                                                                PageServerResponse.StreamingServerResponse streamingData ->
+                                                                                    let
+                                                                                        apiResponse : ToJsPayload.ToJsSuccessPayloadNewCombined
+                                                                                        apiResponse =
+                                                                                            { body = PageServerResponse.streamingResponseToJson streamingData
+                                                                                            , staticHttpCache = Dict.empty
+                                                                                            , statusCode = streamingData.statusCode
+                                                                                            }
+                                                                                                |> ToJsPayload.SendApiResponse
+                                                                                    in
+                                                                                    Effect.SendSinglePage apiResponse
+
                                                                                 PageServerResponse.ErrorPage error record ->
                                                                                     let
                                                                                         currentPage : { path : UrlPath, route : route }

@@ -1,7 +1,7 @@
 module BackendTask.Stream exposing
     ( Stream
     , pipe
-    , fileRead, fileWrite, fromString, http, httpWithInput, stdin, stdout, stderr
+    , fileRead, fileWrite, fromString, http, httpWithInput, requestBody, stdin, stdout, stderr
     , read, readJson, readMetadata, run
     , Error(..)
     , command
@@ -11,6 +11,7 @@ module BackendTask.Stream exposing
     , gzip, unzip
     , customRead, customWrite, customDuplex
     , customReadWithMeta, customTransformWithMeta, customWriteWithMeta
+    , encodePipeline
     )
 
 {-| A `Stream` represents a flow of data through a pipeline.
@@ -51,7 +52,7 @@ End example
 
 @docs pipe
 
-@docs fileRead, fileWrite, fromString, http, httpWithInput, stdin, stdout, stderr
+@docs fileRead, fileWrite, fromString, http, httpWithInput, requestBody, stdin, stdout, stderr
 
 
 ## Running Streams
@@ -238,6 +239,11 @@ export async function customWriteStream(input, { cwd, env, quiet }) {
 
 @docs customReadWithMeta, customTransformWithMeta, customWriteWithMeta
 
+
+## Internals
+
+@docs encodePipeline
+
 -}
 
 import BackendTask exposing (BackendTask)
@@ -325,6 +331,51 @@ ls | elm-pages run script/src/CountLines.elm
 stdin : Stream () () { read : (), write : Never }
 stdin =
     single unit "stdin" []
+
+
+{-| The incoming HTTP request body as a stream. This allows you to handle file uploads and large POST bodies with constant
+memory, regardless of the body size. The `Request` argument connects this stream to the current HTTP request.
+
+**Important:** This is only available in routes defined with [`ApiRoute.serverRenderStreaming`](ApiRoute#serverRenderStreaming).
+In a regular [`ApiRoute.serverRender`](ApiRoute#serverRender) route, the body is automatically buffered and available via
+[`Server.Request.body`](Server-Request#body) — you don't need (and can't use) `requestBody` there.
+
+For example, to accept a file upload and write it directly to disk:
+
+    import ApiRoute
+    import BackendTask
+    import BackendTask.Stream as Stream
+    import Json.Encode as Encode
+    import Server.Response as Response
+
+    uploadRoute =
+        ApiRoute.succeed
+            (\request ->
+                request
+                    |> Stream.requestBody
+                    |> Stream.pipe (Stream.fileWrite "uploads/data.bin")
+                    |> Stream.run
+                    |> BackendTask.map (\_ -> Response.json (Encode.object [ ( "ok", Encode.bool True ) ]))
+            )
+            |> ApiRoute.literal "upload"
+            |> ApiRoute.serverRenderStreaming
+
+You can also compose it with other stream transformations:
+
+    request
+        |> Stream.requestBody
+        |> Stream.pipe Stream.unzip
+        |> Stream.pipe (Stream.fileWrite "uploads/data.txt")
+        |> Stream.run
+
+Note: In a `serverRenderStreaming` route, [`Server.Request.body`](Server-Request#body) returns `Nothing` because the body
+is not buffered. If you need the body as a `String`, use [`Server.Request.readBody`](Server-Request#readBody) — but keep
+in mind that reading the full body into a `String` defeats the purpose of streaming for large payloads.
+
+-}
+requestBody : request -> Stream () () { read : (), write : Never }
+requestBody _ =
+    single unit "requestBody" []
 
 
 {-| Streaming through to stdout can be a convenient way to print a pipeline directly without going through to Elm.
@@ -645,6 +696,14 @@ run stream =
         }
         |> BackendTask.andThen BackendTask.fromResult
         |> BackendTask.allowFatal
+
+
+{-| Encode a stream pipeline to JSON. This is used internally by [`Server.Response.streaming`](Server-Response#streaming) to
+pass the pipeline definition to the server runtime for execution.
+-}
+encodePipeline : Stream error metadata kind -> Encode.Value
+encodePipeline stream =
+    pipelineEncoder stream "none"
 
 
 pipelineEncoder : Stream error metadata kind -> String -> Encode.Value

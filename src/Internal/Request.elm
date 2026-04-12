@@ -1,4 +1,4 @@
-module Internal.Request exposing (Request(..), RequestRecord, fakeRequest, toRequest)
+module Internal.Request exposing (Request(..), RequestRecord, fakeRequest, toRequest, withBody)
 
 import CookieParser
 import Dict exposing (Dict)
@@ -37,6 +37,15 @@ fakeRequest =
         , rawHeaders = Dict.empty
         , cookies = Dict.empty
         }
+
+
+{-| Inject a body into an already-decoded request. Used by `serverRender` to
+populate the body after reading it via BackendTask, so that `Request.body`
+returns the correct value.
+-}
+withBody : Maybe String -> Request -> Request
+withBody maybeBody (Request record) =
+    Request { record | body = maybeBody }
 
 
 requestDecoder : Decode.Decoder RequestRecord
