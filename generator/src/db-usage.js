@@ -12,7 +12,7 @@ import * as path from "node:path";
  */
 function parseImports(source) {
   const imports = [];
-  const importRegex = /^\s*import\s+([A-Z][A-Za-z0-9_]*(?:\.[A-Z][A-Za-z0-9_]*)*)\b/gm;
+  const importRegex = /^import\s+([A-Z][A-Za-z0-9_]*(?:\.[A-Z][A-Za-z0-9_]*)*)\b/gm;
   let match;
   while ((match = importRegex.exec(source)) !== null) {
     imports.push(match[1]);
