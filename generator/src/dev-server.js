@@ -523,8 +523,9 @@ export async function start(options) {
         const body = bodyBuffer ? bodyBuffer.toString("utf-8") : null;
         const serverRequest = await reqToJson(req, body, requestTime);
         // Attach raw buffer for binary-safe Stream.requestBody fallback
+        // Stored on a separate field so Elm's flags decoder still sees body as string|null
         if (bodyBuffer) {
-          serverRequest.body = bodyBuffer;
+          serverRequest.__rawBodyBuffer = bodyBuffer;
         }
 
         try {

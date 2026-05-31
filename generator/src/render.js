@@ -237,7 +237,10 @@ export async function render(
   configuredDbPath = "db.bin";
 
   // Store the buffered body for serverless fallback (Stream.requestBody)
+  // Prefer raw Buffer (__rawBodyBuffer) to preserve binary data integrity;
+  // fall back to the string body for non-binary requests.
   currentBufferedBody =
+    request && request.__rawBodyBuffer ? request.__rawBodyBuffer :
     request && request.body != null ? request.body : null;
   const result = await runElmApp(
     portsFile,
