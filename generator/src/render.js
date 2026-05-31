@@ -47,7 +47,7 @@ let configuredDbPath = "db.bin";
 const requestBodyStreams = new Map();
 /** @type {string | null} */
 let currentRequestId = null;
-/** @type {string | null} */
+/** @type {Buffer | string | null} */
 let currentBufferedBody = null;
 
 /**
@@ -77,7 +77,7 @@ export function setCurrentRequestId(id) {
 
 /**
  * Set the current buffered body for serverless fallback.
- * @param {string | null} body
+ * @param {Buffer | string | null} body
  */
 export function setCurrentBufferedBody(body) {
   currentBufferedBody = body;
@@ -238,7 +238,7 @@ export async function render(
 
   // Store the buffered body for serverless fallback (Stream.requestBody)
   currentBufferedBody =
-    request && typeof request.body === "string" ? request.body : null;
+    request && request.body != null ? request.body : null;
   const result = await runElmApp(
     portsFile,
     basePath,
@@ -1651,6 +1651,12 @@ function runStream(req, portsFile) {
           };
           lastStream.once("finish", onComplete);
           lastStream.once("end", onComplete);
+          // For Readable streams (e.g. HTTP response body from httpWrite),
+          // "end" only fires after all data is consumed. Since kind="none"
+          // means we're discarding the output, call resume() to drain it.
+          if (typeof lastStream.resume === "function" && lastStream.readable) {
+            lastStream.resume();
+          }
         }
       } else if (kind === "command") {
         // already handled in parts.forEach

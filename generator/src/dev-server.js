@@ -508,20 +508,24 @@ export async function start(options) {
       // For serverRenderStreaming routes, Stream.requestBody falls back to
       // Readable.from([bufferedBody]) in the dev server. True zero-copy
       // streaming is available in the Node.js production adapter.
-      /** @type {string | null} */
-      let body = null;
+      /** @type {Buffer[]} */
+      let bodyChunks = [];
 
       req.on("data", function (data) {
-        if (!body) body = "";
-        body += data;
+        bodyChunks.push(Buffer.isBuffer(data) ? data : Buffer.from(data));
       });
 
       req.on("end", async function () {
-        // Don't register req in the stream registry — it's already consumed
-        // by the buffering above. The buffered body is available via
-        // currentBufferedBody (set in render.js from request.body) for both
-        // readBody BackendTask and Stream.requestBody fallback.
+        // Buffer the body as raw bytes to preserve binary data (e.g. gzip uploads).
+        // Convert to string only for the text-based serverRequest (used by Request.body).
+        // The raw Buffer is passed to Stream.requestBody via Readable.from() to preserve binary.
+        const bodyBuffer = bodyChunks.length > 0 ? Buffer.concat(bodyChunks) : null;
+        const body = bodyBuffer ? bodyBuffer.toString("utf-8") : null;
         const serverRequest = await reqToJson(req, body, requestTime);
+        // Attach raw buffer for binary-safe Stream.requestBody fallback
+        if (bodyBuffer) {
+          serverRequest.body = bodyBuffer;
+        }
 
         try {
           await pendingCliCompile;
