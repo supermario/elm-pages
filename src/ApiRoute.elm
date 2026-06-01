@@ -225,17 +225,7 @@ serverRender ((Internal.ApiRoute.ApiRouteBuilder patterns pattern _ _ _) as full
                 Internal.ApiRoute.tryMatch path fullHandler
                     |> Maybe.map
                         (\toBackendTask ->
-                            -- Auto-read the request body so that Request.body works.
-                            -- The body may not be pre-buffered (e.g., in the dev server),
-                            -- so we read it via BackendTask and inject it into the request.
-                            Server.Request.readBody
-                                |> BackendTask.andThen
-                                    (\maybeBody ->
-                                        toBackendTask
-                                            (Internal.Request.toRequest serverRequest
-                                                |> Internal.Request.withBody maybeBody
-                                            )
-                                    )
+                            toBackendTask (Internal.Request.toRequest serverRequest)
                         )
                     |> Maybe.map (BackendTask.map (Server.Response.toJson >> Just))
                     |> Maybe.withDefault
