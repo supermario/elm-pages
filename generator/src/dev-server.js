@@ -271,6 +271,15 @@ export async function start(options) {
     .use(awaitElmMiddleware)
     .use(baseMiddleware(options.base))
     .use(serveCachedFiles)
+    .use(function apiBypass(req, res, next) {
+      // Route API requests directly to processRequest, bypassing vite.middlewares
+      // which can consume/reject large binary POST bodies (e.g. slug uploads)
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        processRequest(req, res, next);
+      } else {
+        next();
+      }
+    })
     .use(vite.middlewares)
     .use(processRequest);
 

@@ -1580,8 +1580,14 @@ async function runReadRequestBody(req) {
       return jsonResponse(req, { error: error.toString() });
     }
   }
-  // Fall back to the buffered body (set by serverless adapters or non-streaming path)
-  return jsonResponse(req, { body: currentBufferedBody });
+  // Fall back to the buffered body (set by serverless adapters or non-streaming path).
+  // Convert Buffer to string so the JSON response contains a decodable string value
+  // (Buffer objects serialize as { type: "Buffer", data: [...] } which breaks Elm decoders).
+  const bodyStr =
+    Buffer.isBuffer(currentBufferedBody)
+      ? currentBufferedBody.toString("utf-8")
+      : currentBufferedBody;
+  return jsonResponse(req, { body: bodyStr });
 }
 
 /**

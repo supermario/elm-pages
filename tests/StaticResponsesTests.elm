@@ -13,6 +13,7 @@ import Pages.Internal.StaticHttpBody exposing (Body(..))
 import Pages.Script as Script
 import Pages.StaticHttp.Request as Request exposing (Request)
 import RequestsAndPending exposing (ResponseBody)
+import Server.Request
 import Test exposing (Test, describe, test)
 
 
@@ -83,6 +84,113 @@ all =
                     )
                   ]
                 ]
+        , describe "readBody BackendTask"
+            [ test "readBody decodes a string body from the response" <|
+                \() ->
+                    Server.Request.readBody
+                        |> BackendTask.map
+                            (\maybeBody ->
+                                case maybeBody of
+                                    Just body ->
+                                        body
+
+                                    Nothing ->
+                                        "NO BODY"
+                            )
+                        |> expectRequestChain "{\"token\":\"x\"}"
+                            [ [ ( internalRequest "read-request-body"
+                                , Encode.object [ ( "body", Encode.string "{\"token\":\"x\"}" ) ]
+                                )
+                              ]
+                            ]
+            , test "readBody returns Nothing when body is null" <|
+                \() ->
+                    Server.Request.readBody
+                        |> BackendTask.map
+                            (\maybeBody ->
+                                case maybeBody of
+                                    Just _ ->
+                                        "HAS BODY"
+
+                                    Nothing ->
+                                        "NO BODY"
+                            )
+                        |> expectRequestChain "NO BODY"
+                            [ [ ( internalRequest "read-request-body"
+                                , Encode.object [ ( "body", Encode.null ) ]
+                                )
+                              ]
+                            ]
+            , test "readBody returns Nothing when body field is missing" <|
+                \() ->
+                    Server.Request.readBody
+                        |> BackendTask.map
+                            (\maybeBody ->
+                                case maybeBody of
+                                    Just _ ->
+                                        "HAS BODY"
+
+                                    Nothing ->
+                                        "NO BODY"
+                            )
+                        |> expectRequestChain "NO BODY"
+                            [ [ ( internalRequest "read-request-body"
+                                , Encode.object []
+                                )
+                              ]
+                            ]
+            , test "readBody returns Nothing when body is a non-string value (Buffer serialization bug)" <|
+                \() ->
+                    -- This test reproduces the original bug: if JS sends a Buffer object
+                    -- instead of a string, the decoder should return Nothing (not crash).
+                    -- The fix is on the JS side (convert Buffer to string), but this test
+                    -- verifies the Elm decoder is resilient to wrong types.
+                    Server.Request.readBody
+                        |> BackendTask.map
+                            (\maybeBody ->
+                                case maybeBody of
+                                    Just _ ->
+                                        "HAS BODY"
+
+                                    Nothing ->
+                                        "NO BODY"
+                            )
+                        |> expectRequestChain "NO BODY"
+                            [ [ ( internalRequest "read-request-body"
+                                , Encode.object
+                                    [ ( "body"
+                                      , Encode.object
+                                            [ ( "type", Encode.string "Buffer" )
+                                            , ( "data", Encode.list Encode.int [ 123, 34, 116, 34, 125 ] )
+                                            ]
+                                      )
+                                    ]
+                                )
+                              ]
+                            ]
+            , test "readBody works with andThen to process the body" <|
+                \() ->
+                    Server.Request.readBody
+                        |> BackendTask.andThen
+                            (\maybeBody ->
+                                case maybeBody of
+                                    Just body ->
+                                        Script.log ("Got body: " ++ body)
+
+                                    Nothing ->
+                                        Script.log "No body"
+                            )
+                        |> expectRequestChain ()
+                            [ [ ( internalRequest "read-request-body"
+                                , Encode.object [ ( "body", Encode.string "hello" ) ]
+                                )
+                              ]
+                            , [ ( log "Got body: hello"
+                                , Encode.object []
+                                )
+                              ]
+                            ]
+            ]
         ]
 
 
@@ -115,6 +223,19 @@ get url =
     , headers = []
     , body = EmptyBody
     , cacheOptions = Nothing
+    , quiet = False
+    , env = Dict.empty
+    , dir = []
+    }
+
+
+internalRequest : String -> Request
+internalRequest name =
+    { url = "elm-pages-internal://" ++ name
+    , method = "GET"
+    , headers = []
+    , body = EmptyBody
+    , cacheOptions = Just (Encode.object [])
     , quiet = False
     , env = Dict.empty
     , dir = []
