@@ -1847,18 +1847,17 @@ async function pipePartToStream(
       stream: newLocal,
     };
   } else if (part.name === "httpWrite") {
-    const makeFetchHappen = makeFetchHappenOriginal.defaults({
-      // cache: mode === "build" ? "no-cache" : "default",
-      cache: "default",
-    });
-    const response = await makeFetchHappen(part.url, {
+    const response = await fetch(part.url, {
       body: lastStream,
       duplex: "half",
       redirect: "follow",
       method: part.method,
-      headers: part.headers,
-      retry: part.retries,
-      timeout: part.timeoutInMs,
+      headers: Object.fromEntries(
+        (part.headers || []).map((h) => [h.key, h.value])
+      ),
+      signal: part.timeoutInMs
+        ? AbortSignal.timeout(part.timeoutInMs)
+        : undefined,
     });
     if (!isLastProcess && !response.ok) {
       resolve({

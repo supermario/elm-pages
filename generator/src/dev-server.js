@@ -752,6 +752,9 @@ export async function start(options) {
     if (req.url.includes("content.dat")) {
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify(error));
+    } else if (req.method !== "GET" && req.method !== "HEAD") {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: typeof error === "string" ? error : JSON.stringify(error) }));
     } else {
       res.writeHead(500, { "Content-Type": "text/html" });
       res.end(errorHtml());
