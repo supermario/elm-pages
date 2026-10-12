@@ -25,6 +25,7 @@ import * as validateStream from "./validate-stream.js";
 import { default as makeFetchHappenOriginal } from "make-fetch-happen";
 import mergeStreams from "@sindresorhus/merge-streams";
 import { parseDbBinHeader, buildDbBin } from "./db-bin-format.js";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 function detectColorSupport() {
   const env = process.env;
@@ -49,6 +50,43 @@ const requestBodyStreams = new Map();
 let currentRequestId = null;
 /** @type {Buffer | string | null} */
 let currentBufferedBody = null;
+
+/**
+ * Per-request state for servers that render several requests concurrently in
+ * one process (the Node.js adapter). The module-level currentRequestId and
+ * currentBufferedBody above are shared by every in-flight render, so with two
+ * uploads in flight the second one to start would hand ITS body stream to the
+ * first one's Stream.requestBody. A render started inside
+ * runWithRequestContext sees only its own request; anything else (the dev
+ * server, serverless adapters, scripts) falls back to the module-level values
+ * exactly as before.
+ *
+ * @type {AsyncLocalStorage<{ requestId: string | null; bufferedBody?: Buffer | string | null }>}
+ */
+const requestContext = new AsyncLocalStorage();
+
+/**
+ * Run `fn` (typically a call to render) with its own request body context.
+ * @template T
+ * @param {{ requestId: string | null }} context
+ * @param {() => T} fn
+ * @returns {T}
+ */
+export function runWithRequestContext(context, fn) {
+  return requestContext.run({ bufferedBody: null, ...context }, fn);
+}
+
+/** @returns {string | null} */
+function activeRequestId() {
+  const store = requestContext.getStore();
+  return store ? store.requestId : currentRequestId;
+}
+
+/** @returns {Buffer | string | null} */
+function activeBufferedBody() {
+  const store = requestContext.getStore();
+  return store ? store.bufferedBody ?? null : currentBufferedBody;
+}
 
 /**
  * Register an HTTP request body stream for use by Stream.requestBody.
@@ -242,6 +280,10 @@ export async function render(
   currentBufferedBody =
     request && request.__rawBodyBuffer ? request.__rawBodyBuffer :
     request && request.body != null ? request.body : null;
+  const store = requestContext.getStore();
+  if (store) {
+    store.bufferedBody = currentBufferedBody;
+  }
   const result = await runElmApp(
     portsFile,
     basePath,
@@ -1569,9 +1611,8 @@ async function runReadKey(req) {
  * is available.
  */
 async function runReadRequestBody(req) {
-  const stream = currentRequestId
-    ? requestBodyStreams.get(currentRequestId)
-    : null;
+  const requestId = activeRequestId();
+  const stream = requestId ? requestBodyStreams.get(requestId) : null;
   if (stream) {
     try {
       const body = await consumers.text(stream);
@@ -1583,10 +1624,11 @@ async function runReadRequestBody(req) {
   // Fall back to the buffered body (set by serverless adapters or non-streaming path).
   // Convert Buffer to string so the JSON response contains a decodable string value
   // (Buffer objects serialize as { type: "Buffer", data: [...] } which breaks Elm decoders).
+  const bufferedBody = activeBufferedBody();
   const bodyStr =
-    Buffer.isBuffer(currentBufferedBody)
-      ? currentBufferedBody.toString("utf-8")
-      : currentBufferedBody;
+    Buffer.isBuffer(bufferedBody)
+      ? bufferedBody.toString("utf-8")
+      : bufferedBody;
   return jsonResponse(req, { body: bodyStr });
 }
 
@@ -1965,7 +2007,7 @@ async function pipePartToStream(
   } else if (part.name === "fromString") {
     return { stream: Readable.from([part.string]) };
   } else if (part.name === "requestBody") {
-    const stream = requestBodyStreams.get(currentRequestId);
+    const stream = requestBodyStreams.get(activeRequestId());
     if (stream) {
       stream.once("error", (error) => {
         stream.destroy();
@@ -1976,8 +2018,9 @@ async function pipePartToStream(
       return { stream };
     }
     // Fallback for serverless environments where the body is pre-buffered
-    if (currentBufferedBody !== null) {
-      return { stream: Readable.from([currentBufferedBody]) };
+    const bufferedBody = activeBufferedBody();
+    if (bufferedBody !== null) {
+      return { stream: Readable.from([bufferedBody]) };
     }
     throw (
       "Stream.requestBody: no request body stream available. " +

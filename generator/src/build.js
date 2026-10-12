@@ -315,6 +315,25 @@ const htmlTemplate = ${JSON.stringify(processedIndexTemplate)};
 const mode = "build";
 const addWatcher = () => {};
 
+// For the Node.js server adapter: Stream.requestBody needs the live request
+// stream registered against the render that asks for it, and streaming
+// responses need the ports file this bundle was built with.
+export {
+  registerRequestBodyStream,
+  unregisterRequestBodyStream,
+  setCurrentRequestId,
+  runWithRequestContext,
+} from "./render.js";
+
+export function executeStreamToResponse(streamPipeline, res, responseInfo) {
+  return renderer.executeStreamToResponse(
+    streamPipeline,
+    res,
+    customBackendTask,
+    responseInfo
+  );
+}
+
 export async function render(request) {
   const requestTime = new Date();
   const response = await renderer.render(
@@ -353,6 +372,13 @@ export async function render(request) {
         kind: response.kind,
         headers: response.body.headers,
         isBase64Encoded: response.body.isBase64Encoded,
+        // A streaming response has no body yet, only the pipeline that
+        // produces it. Servers that can stream (the Node.js adapter) run it
+        // with executeStreamToResponse; the others ignore this field.
+        streamPipeline:
+          response.body.kind === "streaming-server-response"
+            ? response.body.streamPipeline
+            : undefined,
     }
   } else {
     // Replace __STATIC__ placeholders with numeric IDs in the HTML
